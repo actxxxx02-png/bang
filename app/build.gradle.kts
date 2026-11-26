@@ -36,29 +36,21 @@ val hasReleaseSigning = releaseStoreFile != null &&
 val appProjectPath = path
 
 android {
-    namespace = "com.promptcut.app"
-    compileSdk = 36
-    buildToolsVersion = "36.0.0"
-
-    defaultConfig {
-        applicationId = "com.promptcut.app"
-        minSdk = 29
-        targetSdk = 36
-        versionCode = 16
-        versionName = "1.0.0"
-    }
-
     signingConfigs {
-        create("upload") {
-            if (hasReleaseSigning) {
-                storeFile = releaseStoreFile
-                storePassword = releaseStorePassword
-                keyAlias = releaseKeyAlias
-                keyPassword = releaseKeyPassword
-            }
+        debug {
+            storeFile file(System.getProperty("user.home") + "/.android/debug.keystore")
+            storePassword "android"
+            keyAlias "androiddebugkey"
+            keyPassword "android"
         }
     }
 
+    buildTypes {
+        debug {
+            signingConfig signingConfigs.debug
+        }
+    }
+}
     buildTypes {
         debug {
             signingConfig = signingConfigs.getByName("debug")
