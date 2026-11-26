@@ -1,0 +1,2 @@
+          if git grep -nI -E -e '-----BEGIN (RSA |EC |DSA |OPENSSH |ENCRYPTED )?PRIVATE KEY-----|AIza[0-9A-Za-z_-]{35}|sk-ant-[A-Za-z0-9_-]{20,}|gsk_[A-Za-z0-9]{20,}' \
+            -- ':!.github/workflows/' ; then
