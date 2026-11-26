@@ -1,0 +1,196 @@
+name: Deploy GitHub Release (APK & AAB)
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag name (e.g. v1.0.0)"
+        required: true
+        type: string
+      prerelease:
+        description: "Mark GitHub Release as pre-release"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: android-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build Signed Release & Publish to GitHub Releases
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Scan repository for secrets & private keystores
+        run: |
+          set -euo pipefail
+          BAD_FILES=$(git ls-files '*.jks' '*.keystore' 'keystore.properties' '.env' '.env.*' \
+            | grep -vE '(^|/)\.env\.example$' || true)
+          if [ -n "$BAD_FILES" ]; then
+            echo "::error::Committed secret or keystore files detected: $BAD_FILES"
+            exit 1
+          fi
+          if git ls-files --error-unmatch debug.keystore >/dev/null 2>&1; then
+            echo "::error::debug.keystore must not be committed to git."
+            exit 1
+          fi
+          if git grep -nI -E '-----BEGIN (RSA |EC |DSA |OPENSSH |ENCRYPTED )?PRIVATE KEY-----|AIza[0-9A-Za-z_-]{35}|sk-ant-[A-Za-z0-9_-]{20,}|gsk_[A-Za-z0-9]{20,}' \
+            -- ':!.github/workflows/' ; then
+            echo "::error::Potential embedded private key or API secret detected in repository."
+            exit 1
+          fi
+
+      - name: Resolve release tag & validate versionName
+        id: meta
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          case "$TAG" in
+            v[0-9]*) ;;
+            *)
+              echo "::error::Release tag '$TAG' must start with 'v' followed by a version number (e.g. v1.0.0)."
+              exit 1
+              ;;
+          esac
+          TAG_VER="${TAG#v}"
+          GRADLE_VER=$(sed -n 's/.*versionName[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' app/build.gradle.kts | head -n1)
+          if [ -z "$GRADLE_VER" ]; then
+            echo "::error::Could not extract versionName from app/build.gradle.kts."
+            exit 1
+          fi
+          if [ "$TAG_VER" != "$GRADLE_VER" ] && [ "${TAG_VER%%-*}" != "$GRADLE_VER" ]; then
+            echo "::error::Tag version '$TAG_VER' does not match app/build.gradle.kts versionName '$GRADLE_VER'. Update versionName before tagging."
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$GRADLE_VER" >> "$GITHUB_OUTPUT"
+
+      - name: Verify required release signing secrets
+        env:
+          RELEASE_KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+          RELEASE_STORE_PASSWORD: ${{ secrets.RELEASE_STORE_PASSWORD }}
+          RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+        run: |
+          MISSING=""
+          [ -z "$RELEASE_KEYSTORE_BASE64" ] && MISSING="$MISSING RELEASE_KEYSTORE_BASE64"
+          [ -z "$RELEASE_STORE_PASSWORD" ] && MISSING="$MISSING RELEASE_STORE_PASSWORD"
+          [ -z "$RELEASE_KEY_ALIAS" ] && MISSING="$MISSING RELEASE_KEY_ALIAS"
+          [ -z "$RELEASE_KEY_PASSWORD" ] && MISSING="$MISSING RELEASE_KEY_PASSWORD"
+          if [ -n "$MISSING" ]; then
+            echo "::error::Missing required GitHub Actions repository secrets for release deployment:$MISSING"
+            exit 1
+          fi
+          KEYSTORE_PATH="$RUNNER_TEMP/upload-release.jks"
+          printf '%s' "$RELEASE_KEYSTORE_BASE64" | tr -d '\r\n' | base64 --decode > "$KEYSTORE_PATH"
+          test -s "$KEYSTORE_PATH"
+          echo "RELEASE_KEYSTORE_PATH=$KEYSTORE_PATH" >> "$GITHUB_ENV"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: |
+            platform-tools
+            platforms;android-36
+            build-tools;36.0.0
+
+      - name: Verify Android SDK 36 packages
+        run: |
+          SDK_DIR="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          test -d "$SDK_DIR/platforms/android-36"
+          test -d "$SDK_DIR/build-tools/36.0.0"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: wrapper
+
+      - name: Run tests, lint, and build signed Release APK & AAB
+        env:
+          RELEASE_KEYSTORE_PATH: ${{ env.RELEASE_KEYSTORE_PATH }}
+          RELEASE_STORE_PASSWORD: ${{ secrets.RELEASE_STORE_PASSWORD }}
+          RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+        run: |
+          chmod +x gradlew
+          ./gradlew :app:testDebugUnitTest :app:lintDebug assembleRelease bundleRelease --stacktrace --no-daemon
+
+      - name: Verify release signature & package deliverables
+        run: |
+          TAG="${{ steps.meta.outputs.tag }}"
+          APKSIGNER="${ANDROID_HOME:-$ANDROID_SDK_ROOT}/build-tools/36.0.0/apksigner"
+          APK_SRC="app/build/outputs/apk/release/app-release.apk"
+          AAB_SRC="app/build/outputs/bundle/release/app-release.aab"
+
+          test -s "$APK_SRC"
+          test -s "$AAB_SRC"
+
+          CERTS=$("$APKSIGNER" verify --verbose --print-certs "$APK_SRC")
+          echo "$CERTS"
+          if printf '%s' "$CERTS" | grep -qi "CN=Android Debug"; then
+            echo "::error::Refusing to publish an APK signed with Android Debug key."
+            exit 1
+          fi
+
+          mkdir -p build/release-deliverables
+          cp "$APK_SRC" "build/release-deliverables/PromptCut-${TAG}-release.apk"
+          cp "$AAB_SRC" "build/release-deliverables/PromptCut-${TAG}-release.aab"
+          (cd build/release-deliverables && sha256sum "PromptCut-${TAG}-release.apk" "PromptCut-${TAG}-release.aab" > SHA256SUMS.txt)
+
+      - name: Clean up temporary keystore
+        if: always()
+        run: rm -f "$RUNNER_TEMP/upload-release.jks"
+
+      - name: Upload diagnostic reports on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: PromptCut-Release-Diagnostic-Reports
+          path: |
+            app/build/reports/tests/
+            app/build/test-results/
+            app/build/reports/lint-results-debug*
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Attest Release APK & AAB build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            build/release-deliverables/PromptCut-${{ steps.meta.outputs.tag }}-release.apk
+            build/release-deliverables/PromptCut-${{ steps.meta.outputs.tag }}-release.aab
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: "PromptCut ${{ steps.meta.outputs.tag }}"
+          prerelease: ${{ inputs.prerelease || contains(steps.meta.outputs.tag, '-') }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            build/release-deliverables/PromptCut-${{ steps.meta.outputs.tag }}-release.apk
+            build/release-deliverables/PromptCut-${{ steps.meta.outputs.tag }}-release.aab
+            build/release-deliverables/SHA256SUMS.txt

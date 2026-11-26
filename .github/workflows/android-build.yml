@@ -1,0 +1,257 @@
+name: Android CI & Artifact Build
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: android-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build_and_test:
+    name: Test, Lint, Security & Package APKs
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Scan repository for secrets & private keystores
+        run: |
+          set -euo pipefail
+          # 1. Ensure no private keystore or env credential files are tracked
+          BAD_FILES=$(git ls-files '*.jks' '*.keystore' 'keystore.properties' '.env' '.env.*' \
+            | grep -vE '(^|/)\.env\.example$' || true)
+          if [ -n "$BAD_FILES" ]; then
+            echo "::error::Committed secret or keystore files detected: $BAD_FILES"
+            exit 1
+          fi
+
+          # 2. Ensure debug.keystore is never committed
+          if git ls-files --error-unmatch debug.keystore >/dev/null 2>&1; then
+            echo "::error::debug.keystore must not be committed to git."
+            exit 1
+          fi
+
+          # 3. Scan tracked text/source files for embedded private keys or API tokens
+          if git grep -nI -E '-----BEGIN (RSA |EC |DSA |OPENSSH |ENCRYPTED )?PRIVATE KEY-----|AIza[0-9A-Za-z_-]{35}|sk-ant-[A-Za-z0-9_-]{20,}|gsk_[A-Za-z0-9]{20,}' \
+            -- ':!.github/workflows/' ; then
+            echo "::error::Potential embedded private key or API secret detected in repository."
+            exit 1
+          fi
+          echo "Repository secret and keystore hygiene check passed."
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: |
+            platform-tools
+            platforms;android-36
+            build-tools;36.0.0
+
+      - name: Verify Android SDK 36 packages
+        run: |
+          SDK_DIR="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          test -d "$SDK_DIR/platforms/android-36"
+          test -d "$SDK_DIR/build-tools/36.0.0"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: wrapper
+          cache-read-only: ${{ github.ref != 'refs/heads/main' }}
+
+      - name: Validate Gradle wrapper, tasks & release dependency graph
+        run: |
+          test -f gradlew
+          test -f gradle/wrapper/gradle-wrapper.properties
+          test -f gradle/wrapper/gradle-wrapper.jar
+          chmod +x gradlew
+          ./gradlew --version --no-daemon
+          ./gradlew tasks --group=build --no-daemon
+          mkdir -p build/reports
+          ./gradlew :app:dependencies --configuration releaseRuntimeClasspath --no-daemon > build/reports/release-dependencies.txt
+
+      - name: Run unit and Robolectric tests
+        run: ./gradlew :app:testDebugUnitTest --stacktrace --no-daemon
+
+      - name: Run Android Lint
+        run: ./gradlew :app:lintDebug --stacktrace --no-daemon
+
+      - name: Check release signing secrets
+        env:
+          RELEASE_KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+          RELEASE_STORE_PASSWORD: ${{ secrets.RELEASE_STORE_PASSWORD }}
+          RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+        run: |
+          SET_COUNT=0
+          [ -n "$RELEASE_KEYSTORE_BASE64" ] && SET_COUNT=$((SET_COUNT + 1))
+          [ -n "$RELEASE_STORE_PASSWORD" ] && SET_COUNT=$((SET_COUNT + 1))
+          [ -n "$RELEASE_KEY_ALIAS" ] && SET_COUNT=$((SET_COUNT + 1))
+          [ -n "$RELEASE_KEY_PASSWORD" ] && SET_COUNT=$((SET_COUNT + 1))
+
+          if [ "$SET_COUNT" -eq 4 ]; then
+            KEYSTORE_PATH="$RUNNER_TEMP/upload-release.jks"
+            printf '%s' "$RELEASE_KEYSTORE_BASE64" | tr -d '\r\n' | base64 --decode > "$KEYSTORE_PATH"
+            test -s "$KEYSTORE_PATH"
+            echo "RELEASE_KEYSTORE_PATH=$KEYSTORE_PATH" >> "$GITHUB_ENV"
+            echo "RELEASE_SIGNED=true" >> "$GITHUB_ENV"
+            echo "Release signing configured in runner temp directory."
+          elif [ "$SET_COUNT" -eq 0 ]; then
+            echo "RELEASE_SIGNED=false" >> "$GITHUB_ENV"
+            echo "Release signing secrets not configured; skipping signed release build."
+          else
+            echo "::error::Partial release signing secrets configured ($SET_COUNT/4). Provide all 4 RELEASE_* secrets or leave all unset."
+            exit 1
+          fi
+
+      - name: Build Debug APK
+        run: ./gradlew assembleDebug --stacktrace --no-daemon
+
+      - name: Build Signed Release APK & Play App Bundle
+        if: env.RELEASE_SIGNED == 'true'
+        env:
+          RELEASE_KEYSTORE_PATH: ${{ env.RELEASE_KEYSTORE_PATH }}
+          RELEASE_STORE_PASSWORD: ${{ secrets.RELEASE_STORE_PASSWORD }}
+          RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+        run: ./gradlew assembleRelease bundleRelease --stacktrace --no-daemon
+
+      - name: Verify APKs & generate checksums
+        run: |
+          APKSIGNER="${ANDROID_HOME:-$ANDROID_SDK_ROOT}/build-tools/36.0.0/apksigner"
+          mkdir -p build/apk-deliverables
+
+          DEBUG_SRC="app/build/outputs/apk/debug/app-debug.apk"
+          test -s "$DEBUG_SRC"
+          "$APKSIGNER" verify --verbose --print-certs "$DEBUG_SRC"
+          cp "$DEBUG_SRC" build/apk-deliverables/PromptCut-debug.apk
+          DEBUG_BYTES=$(wc -c < build/apk-deliverables/PromptCut-debug.apk)
+          DEBUG_SHA=$(sha256sum build/apk-deliverables/PromptCut-debug.apk | awk '{print $1}')
+          {
+            echo "DEBUG_BYTES=$DEBUG_BYTES"
+            echo "DEBUG_SHA=$DEBUG_SHA"
+          } >> "$GITHUB_ENV"
+
+          if [ "${RELEASE_SIGNED:-false}" = "true" ]; then
+            RELEASE_SRC="app/build/outputs/apk/release/app-release.apk"
+            AAB_SRC="app/build/outputs/bundle/release/app-release.aab"
+            test -s "$RELEASE_SRC"
+            test -s "$AAB_SRC"
+            RELEASE_CERTS=$("$APKSIGNER" verify --verbose --print-certs "$RELEASE_SRC")
+            echo "$RELEASE_CERTS"
+            if printf '%s' "$RELEASE_CERTS" | grep -qi "CN=Android Debug"; then
+              echo "::error::Release APK must not be signed with an Android Debug certificate."
+              exit 1
+            fi
+            cp "$RELEASE_SRC" build/apk-deliverables/PromptCut-release.apk
+            cp "$AAB_SRC" build/apk-deliverables/PromptCut-release.aab
+            RELEASE_BYTES=$(wc -c < build/apk-deliverables/PromptCut-release.apk)
+            RELEASE_SHA=$(sha256sum build/apk-deliverables/PromptCut-release.apk | awk '{print $1}')
+            AAB_BYTES=$(wc -c < build/apk-deliverables/PromptCut-release.aab)
+            AAB_SHA=$(sha256sum build/apk-deliverables/PromptCut-release.aab | awk '{print $1}')
+            {
+              echo "RELEASE_BYTES=$RELEASE_BYTES"
+              echo "RELEASE_SHA=$RELEASE_SHA"
+              echo "AAB_BYTES=$AAB_BYTES"
+              echo "AAB_SHA=$AAB_SHA"
+            } >> "$GITHUB_ENV"
+          fi
+
+          (
+            cd build/apk-deliverables &&
+            rm -f SHA256SUMS.txt &&
+            find . -maxdepth 1 -type f \( -name '*.apk' -o -name '*.aab' \) -printf '%f\n' | sort | xargs sha256sum > SHA256SUMS.txt
+          )
+
+      - name: Clean up temporary keystore
+        if: always()
+        run: rm -f "$RUNNER_TEMP/upload-release.jks"
+
+      - name: Upload test, lint & dependency diagnostic reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: PromptCut-Diagnostic-Reports
+          path: |
+            app/build/reports/tests/
+            app/build/test-results/
+            app/build/reports/lint-results-debug*
+            build/reports/release-dependencies.txt
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Upload Debug APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PromptCut-Debug-APK
+          path: |
+            build/apk-deliverables/PromptCut-debug.apk
+            build/apk-deliverables/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Attest Debug APK build provenance
+        if: github.event_name != 'pull_request'
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: build/apk-deliverables/PromptCut-debug.apk
+
+      - name: Upload Signed Release APK & AAB artifacts
+        if: env.RELEASE_SIGNED == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: PromptCut-Release-Artifacts
+          path: |
+            build/apk-deliverables/PromptCut-release.apk
+            build/apk-deliverables/PromptCut-release.aab
+            build/apk-deliverables/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Attest Release APK & AAB build provenance
+        if: github.event_name != 'pull_request' && env.RELEASE_SIGNED == 'true'
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            build/apk-deliverables/PromptCut-release.apk
+            build/apk-deliverables/PromptCut-release.aab
+
+      - name: Write build summary
+        if: always()
+        env:
+          RELEASE_SIGNED: ${{ env.RELEASE_SIGNED }}
+        run: |
+          {
+            echo "## PromptCut CI Build Summary"
+            echo ""
+            echo "- **Branch/Ref:** \`${GITHUB_REF_NAME}\`"
+            echo "- **Commit:** \`${GITHUB_SHA}\`"
+            echo "- **Release signing configured:** ${RELEASE_SIGNED:-false}"
+            echo ""
+            echo "| Artifact | Size (bytes) | SHA-256 |"
+            echo "|---|---:|---|"
+            echo "| Debug APK | ${DEBUG_BYTES:-N/A} | \`${DEBUG_SHA:-N/A}\` |"
+            if [ "${RELEASE_SIGNED:-false}" = "true" ]; then
+              echo "| Release APK | ${RELEASE_BYTES:-N/A} | \`${RELEASE_SHA:-N/A}\` |"
+              echo "| Release AAB | ${AAB_BYTES:-N/A} | \`${AAB_SHA:-N/A}\` |"
+            else
+              echo "| Release APK / AAB | Skipped (secrets not set) | N/A |"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

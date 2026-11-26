@@ -1,0 +1,83 @@
+name: Deploy Docs to GitHub Pages
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "docs/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  check_pages:
+    name: Check GitHub Pages enablement
+    runs-on: ubuntu-latest
+    outputs:
+      enabled: ${{ steps.check.outputs.enabled }}
+      build_type: ${{ steps.check.outputs.build_type }}
+    steps:
+      - name: Check repository GitHub Pages configuration
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          HTTP_CODE=$(curl -sS -o "$RUNNER_TEMP/pages.json" -w "%{http_code}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${{ github.repository }}/pages" || echo "000")
+
+          BUILD_TYPE=""
+          if [ "$HTTP_CODE" = "200" ] && [ -s "$RUNNER_TEMP/pages.json" ]; then
+            BUILD_TYPE=$(jq -r '.build_type // ""' "$RUNNER_TEMP/pages.json")
+          fi
+
+          if [ "$HTTP_CODE" = "200" ] && [ "$BUILD_TYPE" = "workflow" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "build_type=$BUILD_TYPE" >> "$GITHUB_OUTPUT"
+            echo "GitHub Pages is enabled with Source = GitHub Actions."
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "build_type=${BUILD_TYPE:-none}" >> "$GITHUB_OUTPUT"
+            echo "::notice::Skipping GitHub Pages deployment (HTTP $HTTP_CODE, build_type=${BUILD_TYPE:-none}). Enable Settings -> Pages -> Source: GitHub Actions to publish docs/."
+            {
+              echo "## GitHub Pages Deployment Skipped"
+              echo ""
+              echo "- **Pages API status:** HTTP \`$HTTP_CODE\`"
+              echo "- **Configured build type:** \`${BUILD_TYPE:-none}\`"
+              echo "- **Action required to publish \`docs/\`:** Go to **Settings → Pages → Build and deployment → Source** and select **GitHub Actions**."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  deploy:
+    name: Deploy static docs to GitHub Pages
+    needs: check_pages
+    if: needs.check_pages.outputs.enabled == 'true'
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload docs artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: "./docs"
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

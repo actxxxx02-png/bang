@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PromptCut Privacy Policy</title>
+<style>body{font:16px/1.6 system-ui,sans-serif;max-width:720px;margin:32px auto;padding:0 16px;color:#111}h1{font-size:28px}h2{font-size:20px;margin-top:28px}.note{background:#f3f3f3;border-left:3px solid #111;padding:10px 14px;font-size:14px}</style>
+</head><body>
+<h1>PromptCut Privacy Policy</h1>
+<p>Last updated: 26 November 2026</p>
+<p class="note"><b>Publication Notice:</b> Served from <code>docs/privacy-policy.html</code> via GitHub Pages (<a href="index.html">PromptCut Home</a>). Before Google Play Store submission, verify GitHub Pages is enabled in repository settings and replace the contact address below.</p>
+<p>PromptCut is an offline-first AI video editing app. It edits and renders videos locally on your device. This policy explains what data leaves your phone, where it goes, and why.</p>
+
+<h2>Data that stays on your phone</h2>
+<p>Your source videos, edited timelines, rendered exports, Room project history, and on-device analysis (shots, faces, labels, OCR text cues, loudness envelopes) stay on your phone. PromptCut has no user accounts, no ads, no analytics trackers, and operates no backend servers of its own.</p>
+
+<h2>Data sent to third-party services you choose</h2>
+<ul>
+<li><b>AI planning &amp; agent tools (Google Gemini, Groq, or optional user-consented Anthropic Claude).</b> To plan or refine edits, PromptCut sends compact text metadata (durations, shot timings, detected objects, speech transcripts, and your instructions) to the AI provider whose API key you configured. When frame sampling is enabled for vision-capable models (Gemini or Claude), only low-resolution still frames are sent — full videos are never uploaded without explicit consent.</li>
+<li><b>Anthropic Claude (Paid API, manual opt-in only).</b> PromptCut never routes requests to Claude automatically. Claude is only invoked when you manually select Claude and enable explicit paid-API consent in Settings.</li>
+<li><b>Speech-to-text (Groq Whisper), when enabled.</b> If an enabled Groq key is saved and Groq STT is toggled on, compressed speech audio is sent to Groq to generate timed subtitles and avoid cutting mid-sentence.</li>
+<li><b>Free music (Openverse).</b> Music search queries are sent to <a href="https://openverse.org/">Openverse</a>, and tracks you select are downloaded from their hosts.</li>
+</ul>
+
+<h2>Your API keys</h2>
+<p>All API keys you save (multiple keys per provider supported) are encrypted on-device using Android Keystore AES-256-GCM with zero plaintext fallback and are never logged or shared with third parties other than their own provider endpoints.</p>
+
+<h2>Permissions</h2>
+<ul>
+<li><b>Photos and videos (Android Photo Picker):</b> only the videos you select are accessed.</li>
+<li><b>Internet:</b> solely to connect to the AI provider keys you configured and optional Openverse music search.</li>
+<li><b>Notifications and foreground service:</b> to display local render progress and allow safe export recovery if interrupted.</li>
+</ul>
+
+<h2>Children</h2>
+<p>PromptCut is not directed at children under 13.</p>
+
+<h2>Deleting your data</h2>
+<p>Deleting keys in Settings or uninstalling PromptCut removes all locally encrypted keys and projects from your device. Provider-side keys can be revoked anytime in Google AI Studio, Groq Console, or Anthropic Console.</p>
+
+<h2>Contact</h2>
+<p>Repository: <a href="https://github.com/actxxxx02-png/AngKur-v2">https://github.com/actxxxx02-png/AngKur-v2</a> (update with maintainer contact email before Play Store publication).</p>
+</body></html>

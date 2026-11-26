@@ -1,0 +1,15 @@
+keystore.properties
+*.jks
+*.keystore
+!debug.keystore
+.env
+.env.*
+!.env.example
+local.properties
+build/
+.gradle/
+.kotlin/
+*.log
+t.log
+.idea/
+*.iml
